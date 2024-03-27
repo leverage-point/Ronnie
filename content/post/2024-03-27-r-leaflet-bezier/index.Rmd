@@ -1,0 +1,214 @@
+---
+title: R语言leaflet绘图：Bezier曲线绘制
+author: Ronnie
+date: '2024-03-27'
+slug: r-leaflet-bezier
+categories:
+  - R
+tags:
+  - plots
+---
+
+博客回归版，继2022年创建这个网页博客后迟迟未动笔，最近接手了一个在R中使用`leaflet`包绘制OD（Origin-Destination）图的任务，简单记录一下实操过程中的一些tricks。
+
+## leaflet绘制OD图的基本步骤
+
+```{r, echo=FALSE}
+dir <- 'D:/ly/study_material/PhDinStatistics/助研/GIS作图/数据/'
+sector <- '06'
+```
+
+加载绘制过程中需要使用的package，同时定义了一个`MinMaxScale`函数，用来对图形中的边权重进行变换。
+
+```{r, warning=FALSE, message=FALSE}
+library(leaflet)
+library(leafletCN)
+library(RColorBrewer)
+library(geosphere)
+library(sp)
+library(dplyr)
+library(readxl)
+library(bezier)
+
+MinMaxScale <- function(vec) {
+  (vec-min(vec)) / (max(vec)-min(vec))
+}
+```
+
+以下是一些数据读取和预处理的过程，作为示例，只展示数据的前5行。
+
+```{r, warning=FALSE, message=FALSE}
+dt0 <- read.csv(paste0(dir, 'Point.csv'))
+dt1 <- read_excel(paste0(dir, sector, '/bian_come.xlsx'))
+dt2 <- merge(dt0, dt1, by.x = 'Name', by.y = 'name')
+dt2$to_X <- 104.6494; dt2$to_Y <- 28.75801
+dt2$Weight[which(dt2$Weight!=0)] <- log(sqrt(dt2$Weight[which(dt2$Weight!=0)])*1000)
+dt <- dt2 %>% select(c('Lon', 'Lat', 'to_X', 'to_Y', 'Weight', 'Name'))
+colnames(dt) <- c('from_X', 'from_Y', 'to_X', 'to_Y', 'weight', 'city')
+dt$weight <- MinMaxScale(dt$weight)
+dt <- dt[which(dt$city!='宜宾'), ]
+head(dt, 5)
+```
+
+绘图时，首先使用`geosphere::gcIntermediate`对地理数据进行插值，然后进行绘图，此时，当地图上两点之间的经纬度坐标相距较远时，插值后绘制的线条曲率较小。
+
+```{r, message=FALSE, warning=FALSE}
+flows <- gcIntermediate(dt[,1:2], dt[,3:4], n = 10, sp = TRUE, addStartEnd = TRUE)
+flows$weight <- dt$weight
+color_func <- colorNumeric(palette = "Purples", domain = flows$weight)
+
+m <- leaflet() %>%
+  # amap() %>%   # 高德地图
+  # addTiles() %>% # default map
+  addProviderTiles('CartoDB.PositronNoLabels') %>% # for more map, refer to: https://leaflet-extras.github.io/leaflet-providers/preview/index.html
+  setView(lng = 110, lat = 29, zoom = 5.5) %>%
+  addPolylines(data = flows, weight = ~weight*9, color = ~color_func(weight), opacity = 0.6) %>%
+  addCircleMarkers(lng = dt$from_X, lat = dt$from_Y, radius = 1, color = 'blue', label = NULL, opacity = 0.6) %>%
+  addLabelOnlyMarkers(lng = 104.6494, lat = 28.7580, label = '宜宾', 
+                      labelOptions = labelOptions(noHide = T, 
+                                                  textOnly = T, 
+                                                  offset = c(-16, 3),
+                                                  textsize = '24px'))
+
+# add notation
+for(i in 1:nrow(dt)) {
+  if(dt$city[i]=='宜宾')
+    next
+  m <- m %>% 
+    addLabelOnlyMarkers(lng = dt$from_X[i], lat = dt$from_Y[i], label = dt$city[i], 
+                        labelOptions = labelOptions(noHide = T, 
+                                                    textOnly = T, 
+                                                    offset = c(4, 3),
+                                                    opacity = 0.9, 
+                                                    textsize = paste0((1+dt$weight[i])*12,'px')))
+}
+m
+```
+
+## leaflet绘制OD图的进阶步骤：使用bezier曲线绘制曲线
+
+为了使得地图上两点间连线的曲率变小，对`geosphere::gcIntermediate`进行重写。
+
+```{r, warning=FALSE, message=FALSE}
+my.interm <- function (p1, p2, n) {
+  if (antipodal(p1, p2)) {
+    return(rep(Inf, nrow(p1)))
+  }
+  if (isTRUE(all.equal(p1, p2))) {
+    return(cbind(rep(p1[, 1], nrow(p1)), rep(p1[, 2], nrow(p1))))
+  }
+  offsetX <- p2[, 1] - p1[, 1]
+  offsetY <- p2[, 2] - p1[, 2]
+  
+  r <- sqrt(offsetX^2 + offsetY^2)
+  theta <- atan2(offsetY, offsetX)
+  
+  thetaOffset <- pi/10
+  
+  r2 <- (r/2)/cos(thetaOffset)
+  theta2 <- theta + thetaOffset
+  
+  midpointX <- r2 * cos(theta2) + p1[, 1]
+  midpointY <- r2 * sin(theta2) + p1[, 2]
+  
+  midpointLatLng <- c(midpointX, midpointY)
+  
+  t <- seq(0, 1, length = n)
+  p1 <- matrix(p1, nrow = 1)
+  p2 <- matrix(p2, nrow = 1)
+  midpointLatLng <- matrix(midpointLatLng, nrow = 1)
+  
+  p <- rbind(p1, midpointLatLng, p2)
+  p <- matrix(as.numeric(p), ncol = 2)
+  bezier_points <- tryCatch({
+    bezier(t=t, p=p[1:3, 1:2])
+  }, error = function(e) {
+    pp <- p
+    if(midpointLatLng[1, 2] <= (p1[1, 2]+p2[1, 2])/2) {
+      pp[2, 1:2] <- pp[2, 1:2] - 1.5
+    } else {
+      pp[2, 1:2] <- pp[2, 1:2] + 1.5
+    }
+    bezier(t=t, p=pp[1:3, 1:2])
+  })
+  bezier_points
+}
+
+my.gcIntermediate <- function (p1, p2, n = 50, breakAtDateLine = FALSE, addStartEnd = FALSE, 
+                               sp = FALSE, sepNA = FALSE) {
+  p <- cbind(p1[, 1], p1[, 2], p2[, 1], p2[, 2], as.vector(n))
+  res <- list()
+  for (i in 1:nrow(p)) {
+    x <- my.interm(p[i, 1:2, drop=F], p[i, 3:4, drop=F], p[i, 5])
+    res[[i]] <- x
+  }
+  if (sp) {
+    for (i in 1:length(res)) {
+      if (!is.list(res[[i]])) {
+        res[[i]] <- Lines(list(Line(res[[i]])), ID = as.character(i))
+      }
+      else {
+        res[[i]] <- Lines(list(Line(res[[i]][[1]]), Line(res[[i]][[2]])), 
+                          ID = as.character(i))
+      }
+    }
+    res <- SpatialLines(res, CRS("+proj=longlat +ellps=WGS84"))
+  }
+  else if (nrow(p) == 1) {
+    res <- res[[1]]
+  }
+  else if (sepNA) {
+    r <- res[[1]]
+    for (i in 2:length(res)) {
+      r <- rbind(r, c(NA, NA), res[[i]])
+    }
+    return(r)
+  }
+  return(res)
+}
+```
+
+在重写的函数中，首先参考[Creating consistently curved lines on Leaflet](https://ryancatalani.medium.com/creating-consistently-curved-lines-on-leaflet-b59bc03fa9dc)，基于起点和终点坐标求出一个bezier曲线上的参考点，再使用`bezier::bezier`得到bezier曲线上的`n`个点。接下来，我们使用这个重写的函数进行绘图。
+
+```{r, warning=FALSE, message=FALSE}
+flows <- my.gcIntermediate(dt[,1:2], dt[,3:4], n = 10, sp = TRUE, addStartEnd = TRUE)
+flows$weight <- dt$weight
+color_func <- colorNumeric(palette = "Purples", domain = flows$weight)
+
+m <- leaflet() %>%
+  # amap() %>%   # 高德地图
+  # addTiles() %>% # default map
+  addProviderTiles('CartoDB.PositronNoLabels') %>% # for more map, refer to: https://leaflet-extras.github.io/leaflet-providers/preview/index.html
+  setView(lng = 110, lat = 29, zoom = 5.5) %>%
+  addPolylines(data = flows, weight = ~weight*9, color = ~color_func(weight), opacity = 0.6) %>%
+  addCircleMarkers(lng = dt$from_X, lat = dt$from_Y, radius = 1, color = 'blue', label = NULL, opacity = 0.6) %>%
+  addLabelOnlyMarkers(lng = 104.6494, lat = 28.7580, label = '宜宾', 
+                      labelOptions = labelOptions(noHide = T, 
+                                                  textOnly = T, 
+                                                  offset = c(-16, 3),
+                                                  textsize = '24px'))
+
+# add notation
+for(i in 1:nrow(dt)) {
+  if(dt$city[i]=='宜宾')
+    next
+  m <- m %>% 
+    addLabelOnlyMarkers(lng = dt$from_X[i], lat = dt$from_Y[i], label = dt$city[i], 
+                        labelOptions = labelOptions(noHide = T, 
+                                                    textOnly = T, 
+                                                    offset = c(4, 3),
+                                                    opacity = 0.9, 
+                                                    textsize = paste0((1+dt$weight[i])*12,'px')))
+}
+m
+```
+
+最后，插入一段将`leaflet`绘制的图片导出成.png图片的方法：
+
+```{r, eval=FALSE}
+htmlwidgets::saveWidget(m, "temp.html", selfcontained = FALSE)
+webshot2::webshot("temp.html", file = "temp.png", vwidth = 1200, zoom=2)
+```
+
+
+
